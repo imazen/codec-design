@@ -358,6 +358,91 @@ animation = []    # Multi-frame support
 parallel = []     # Multi-threaded encoding
 ```
 
+### SIMD with archmage (When Autovectorization Fails)
+
+When the compiler can't autovectorize critical loops (DCT, color conversion, filtering), use [archmage](https://crates.io/crates/archmage) for safe, explicit SIMD:
+
+```rust
+use archmage::{Desktop64, HasAvx2, SimdToken, arcane};
+use archmage::mem::avx;
+use std::arch::x86_64::*;
+
+/// Process 8 pixels at once with AVX2
+#[arcane]
+fn apply_gamma_avx2(token: impl HasAvx2, pixels: &mut [[f32; 8]]) {
+    let gamma = _mm256_set1_ps(2.2);
+    for chunk in pixels {
+        let v = avx::_mm256_loadu_ps(token, chunk);
+        // pow approximation via exp(gamma * log(v))
+        let result = fast_pow_avx2(v, gamma);
+        avx::_mm256_storeu_ps(token, chunk, result);
+    }
+}
+
+// Dispatch based on CPU capabilities
+pub fn apply_gamma(pixels: &mut [f32]) {
+    if let Some(token) = Desktop64::summon() {
+        // AVX2 path - ~8x faster
+        let chunks: &mut [[f32; 8]] = bytemuck::cast_slice_mut(pixels);
+        apply_gamma_avx2(token, chunks);
+    } else {
+        // Scalar fallback
+        for p in pixels {
+            *p = p.powf(2.2);
+        }
+    }
+}
+```
+
+**Key points:**
+
+1. **Never use `unsafe` for loads/stores** - use `archmage::mem::*` wrappers:
+   ```rust
+   // ❌ WRONG
+   let v = unsafe { _mm256_loadu_ps(data.as_ptr()) };
+
+   // ✅ CORRECT
+   let v = avx::_mm256_loadu_ps(token, data);
+   ```
+
+2. **Use `Desktop64` as your baseline** - covers 95%+ of x86-64 CPUs (Haswell 2013+, Zen 1+)
+
+3. **Token bounds enable generic code**:
+   ```rust
+   #[arcane]
+   fn dct_8x8<T: HasAvx2 + HasFma>(token: T, block: &mut [f32; 64]) {
+       // Works with Desktop64, Avx2FmaToken, etc.
+   }
+   ```
+
+4. **Test scalar fallbacks** with `ARCHMAGE_DISABLE=1 cargo test`
+
+5. **Cross-platform dispatch** without `#[cfg]` guards:
+   ```rust
+   use archmage::{Desktop64, NeonToken, SimdToken};
+
+   pub fn process(data: &mut [f32]) {
+       if let Some(t) = Desktop64::summon() {
+           process_avx2(t, data);
+       } else if let Some(t) = NeonToken::summon() {
+           process_neon(t, data);
+       } else {
+           process_scalar(data);
+       }
+   }
+   ```
+
+**When to use archmage vs autovectorization:**
+
+| Scenario | Approach |
+|----------|----------|
+| Simple loops (add, multiply) | Let compiler autovectorize |
+| Complex shuffles, permutes | archmage |
+| DCT/IDCT butterflies | archmage |
+| Precise FMA ordering | archmage |
+| Gather/scatter | archmage |
+| Bit manipulation (BMI) | archmage |
+
 ---
 
 ## Anti-Patterns to Avoid
