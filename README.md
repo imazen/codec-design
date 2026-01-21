@@ -358,6 +358,127 @@ animation = []    # Multi-frame support
 parallel = []     # Multi-threaded encoding
 ```
 
+### Essential Crates
+
+Use these crates for buffer handling and type safety:
+
+```toml
+[dependencies]
+rgb = "0.8"       # Typed pixel structs (RGB8, RGBA8, etc.)
+imgref = "1.10"   # Strided 2D image views
+bytemuck = "1.14" # Safe transmute for [f32; 8] <-> &[f32]
+```
+
+**Why these matter:**
+
+- **`rgb`**: Provides `RGB<u8>`, `RGBA<f32>`, etc. with correct memory layout. Avoids manual channel indexing.
+- **`imgref`**: `ImgVec<P>` and `ImgRef<P>` support strided buffers, enabling `chunks_exact` iteration.
+- **`bytemuck`**: Safe casting between `&[f32]` and `&[[f32; 8]]` for SIMD chunk processing.
+
+```rust
+use imgref::ImgVec;
+use rgb::RGBA8;
+use bytemuck::cast_slice_mut;
+
+// Strided buffer enables efficient row iteration
+let img: ImgVec<RGBA8> = decode_rgba(&data)?;
+for row in img.rows() {
+    // Each row is contiguous, perfect for chunks_exact
+    for chunk in row.chunks_exact(8) {
+        process_8_pixels(chunk);
+    }
+}
+
+// Safe SIMD chunk casting
+let floats: &mut [f32] = &mut buffer;
+let chunks: &mut [[f32; 8]] = cast_slice_mut(floats);
+```
+
+---
+
+## SIMD Strategy
+
+### The `wide` Crate (Portable SIMD)
+
+The [`wide`](https://crates.io/crates/wide) crate provides portable SIMD types (`f32x8`, `i32x8`, etc.) that help the compiler vectorize:
+
+```rust
+use wide::f32x8;
+
+fn process_row(data: &mut [f32]) {
+    for chunk in data.chunks_exact_mut(8) {
+        let v = f32x8::from(chunk);
+        let result = v * f32x8::splat(2.0) + f32x8::splat(1.0);
+        chunk.copy_from_slice(result.as_array_ref());
+    }
+}
+```
+
+**Limitation:** `wide` uses `cfg(target_feature)` (compile-time check), NOT runtime detection. When distributed without `-C target-cpu=x86-64-v3`, it compiles to the lowest common denominator (SSE2/SSE4.1).
+
+**Workaround with `#[multiversed]`:** Place the dispatch macro at a high level, outside the loop, with `wide` usage in `#[inline(always)]` inner functions:
+
+```rust
+use multiversioned::multiversioned;
+use wide::f32x8;
+
+#[inline(always)]
+fn inner_loop(data: &mut [f32]) {
+    for chunk in data.chunks_exact_mut(8) {
+        let v = f32x8::from(chunk);
+        // ... wide operations
+    }
+}
+
+#[multiversioned(targets("x86_64+avx2+fma", "x86_64+sse4.1", "aarch64+neon"))]
+pub fn process(data: &mut [f32]) {
+    inner_loop(data);  // Compiler can still optimize
+}
+```
+
+The compiler optimizes significantly even without native AVX2—but not as much as with proper runtime dispatch.
+
+### Autovectorization (Let the Compiler Do It)
+
+For many operations, simple scalar code autovectorizes better than explicit chunked loops:
+
+```rust
+use multiversion::multiversion;
+
+// ✅ GOOD: Simple iterator - compiler autovectorizes perfectly
+#[multiversion(targets("x86_64+avx2+fma", "x86_64+sse4.1", "aarch64+neon"))]
+fn scale_row(data: &mut [f32], factor: f32) {
+    for x in data.iter_mut() {
+        *x *= factor;
+    }
+}
+
+// ❌ WORSE: Explicit chunks can PREVENT vectorization
+fn scale_row_chunked(data: &mut [f32], factor: f32) {
+    for chunk in data.chunks_exact_mut(8) {
+        for i in 0..8 {  // This loop often prevents vectorization!
+            chunk[i] *= factor;
+        }
+    }
+}
+```
+
+**When `chunks_exact` helps:** When you need to process fixed-size blocks (8x8 DCT, 16-byte alignment) or use `bytemuck` casting:
+
+```rust
+// ✅ GOOD: chunks_exact for block processing
+let blocks: &mut [[f32; 64]] = bytemuck::cast_slice_mut(data);
+for block in blocks {
+    dct_8x8(block);
+}
+
+// ✅ GOOD: Assert length for compiler hints
+fn process_block(data: &mut [f32]) {
+    assert!(data.len() >= 16);
+    // Compiler now knows bounds, can vectorize
+}
+```
+
 ### SIMD with archmage (When Autovectorization Fails)
 
 When the compiler can't autovectorize critical loops (DCT, color conversion, filtering), use [archmage](https://crates.io/crates/archmage) for safe, explicit SIMD:
@@ -396,7 +517,12 @@ pub fn apply_gamma(pixels: &mut [f32]) {
 
 **Key points:**
 
-1. **Never use `unsafe` for loads/stores** - use `archmage::mem::*` wrappers:
+1. **Only 2-3 targets matter in practice:**
+   - **X86V3 (AVX2+FMA)**: `Desktop64` - covers 95%+ of x86-64 CPUs (Haswell 2013+, Zen 1+)
+   - **X86V4 (AVX-512)**: Optional - CPUs often optimize AVX2 to AVX-512 in microcode
+   - **NeonFp16**: ARM with half-precision support (Apple Silicon, newer ARM servers)
+
+2. **Never use `unsafe` for loads/stores** - use `archmage::mem::*` wrappers:
    ```rust
    // ❌ WRONG
    let v = unsafe { _mm256_loadu_ps(data.as_ptr()) };
@@ -405,26 +531,24 @@ pub fn apply_gamma(pixels: &mut [f32]) {
    let v = avx::_mm256_loadu_ps(token, data);
    ```
 
-2. **Use `Desktop64` as your baseline** - covers 95%+ of x86-64 CPUs (Haswell 2013+, Zen 1+)
-
-3. **Token bounds enable generic code**:
+3. **Use `Desktop64` as your baseline** - it's X86V3 (AVX2+FMA):
    ```rust
    #[arcane]
    fn dct_8x8<T: HasAvx2 + HasFma>(token: T, block: &mut [f32; 64]) {
-       // Works with Desktop64, Avx2FmaToken, etc.
+       // Works with Desktop64, covers nearly all modern x86
    }
    ```
 
 4. **Test scalar fallbacks** with `ARCHMAGE_DISABLE=1 cargo test`
 
-5. **Cross-platform dispatch** without `#[cfg]` guards:
+5. **Simple dispatch pattern** (AVX-512 often not worth the complexity):
    ```rust
-   use archmage::{Desktop64, NeonToken, SimdToken};
+   use archmage::{Desktop64, NeonFp16Token, SimdToken};
 
    pub fn process(data: &mut [f32]) {
        if let Some(t) = Desktop64::summon() {
            process_avx2(t, data);
-       } else if let Some(t) = NeonToken::summon() {
+       } else if let Some(t) = NeonFp16Token::summon() {
            process_neon(t, data);
        } else {
            process_scalar(data);
@@ -437,11 +561,12 @@ pub fn apply_gamma(pixels: &mut [f32]) {
 | Scenario | Approach |
 |----------|----------|
 | Simple loops (add, multiply) | Let compiler autovectorize |
+| Long row iteration | `multiversion` + scalar code |
 | Complex shuffles, permutes | archmage |
 | DCT/IDCT butterflies | archmage |
 | Precise FMA ordering | archmage |
 | Gather/scatter | archmage |
-| Bit manipulation (BMI) | archmage |
+| Small fixed-size blocks (8x8) | archmage (autovec often fails) |
 
 ---
 
