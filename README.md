@@ -479,24 +479,70 @@ fn process_block(data: &mut [f32]) {
 }
 ```
 
+### Rust 1.85+ Contextual Intrinsic Safety
+
+**Key insight:** As of Rust 1.85, value-based SIMD intrinsics are **safe** inside `#[target_feature]` functions. No `unsafe` block needed!
+
+```rust
+#[target_feature(enable = "avx2")]
+fn process_avx2(a: __m256, b: __m256) -> __m256 {
+    // ALL of these are SAFE - no unsafe block!
+    let sum = _mm256_add_ps(a, b);
+    let prod = _mm256_mul_ps(sum, sum);
+    let blended = _mm256_blend_ps::<0b10101010>(prod, sum);
+    _mm256_sqrt_ps(blended)
+}
+```
+
+**What's still unsafe:**
+- **Pointer-based operations** (load/store with raw pointers) - use `safe_unaligned_simd` or archmage::mem
+- **Calling** a `#[target_feature]` function from normal code - use archmage tokens for safe dispatch
+
+**The `#[arcane]` macro** generates the `#[target_feature]` inner function, so inside archmage functions, value intrinsics are safe:
+
+```rust
+use archmage::{arcane, Has256BitSimd};
+use std::arch::x86_64::*;
+
+#[arcane]
+fn dct_butterfly(_token: impl Has256BitSimd, a: __m256, b: __m256) -> (__m256, __m256) {
+    // Safe! No unsafe needed for value operations
+    let sum = _mm256_add_ps(a, b);
+    let diff = _mm256_sub_ps(a, b);
+    (sum, diff)
+}
+```
+
+**For loads/stores**, use `safe_unaligned_simd` which is also safe inside `#[arcane]`:
+
+```rust
+#[arcane]
+fn load_and_process(_token: impl Has256BitSimd, data: &[f32; 8]) -> __m256 {
+    // safe_unaligned_simd has #[target_feature], so this is a safe call!
+    let v = safe_unaligned_simd::x86_64::_mm256_loadu_ps(data);
+    _mm256_mul_ps(v, v)  // Also safe
+}
+```
+
 ### SIMD with archmage (When Autovectorization Fails)
 
 When the compiler can't autovectorize critical loops (DCT, color conversion, filtering), use [archmage](https://crates.io/crates/archmage) for safe, explicit SIMD:
 
 ```rust
-use archmage::{Desktop64, HasAvx2, SimdToken, arcane};
-use archmage::mem::avx;
+use archmage::{Desktop64, Has256BitSimd, SimdToken, arcane};
 use std::arch::x86_64::*;
 
 /// Process 8 pixels at once with AVX2
 #[arcane]
-fn apply_gamma_avx2(token: impl HasAvx2, pixels: &mut [[f32; 8]]) {
+fn apply_gamma_avx2(_token: impl Has256BitSimd, pixels: &mut [[f32; 8]]) {
     let gamma = _mm256_set1_ps(2.2);
     for chunk in pixels {
-        let v = avx::_mm256_loadu_ps(token, chunk);
-        // pow approximation via exp(gamma * log(v))
+        // Use safe_unaligned_simd for loads (safe inside #[arcane])
+        let v = safe_unaligned_simd::x86_64::_mm256_loadu_ps(chunk);
+        // Value intrinsics are safe inside #[arcane] - no unsafe needed!
         let result = fast_pow_avx2(v, gamma);
-        avx::_mm256_storeu_ps(token, chunk, result);
+        // Store still needs unsafe (raw pointer)
+        unsafe { _mm256_storeu_ps(chunk.as_mut_ptr(), result) };
     }
 }
 
@@ -517,38 +563,46 @@ pub fn apply_gamma(pixels: &mut [f32]) {
 
 **Key points:**
 
-1. **Only 2-3 targets matter in practice:**
+1. **Value intrinsics are SAFE inside `#[arcane]`** (Rust 1.85+):
+   ```rust
+   #[arcane]
+   fn process(_token: impl Has256BitSimd, a: __m256, b: __m256) -> __m256 {
+       // No unsafe needed! Value operations are safe in #[target_feature] context
+       _mm256_add_ps(_mm256_mul_ps(a, b), a)
+   }
+   ```
+
+2. **Use `safe_unaligned_simd` for loads** (also safe inside `#[arcane]`):
+   ```rust
+   #[arcane]
+   fn load(_token: impl Has256BitSimd, data: &[f32; 8]) -> __m256 {
+       safe_unaligned_simd::x86_64::_mm256_loadu_ps(data)  // Safe call!
+   }
+   ```
+
+3. **Only 2-3 targets matter in practice:**
    - **X86V3 (AVX2+FMA)**: `Desktop64` - covers 95%+ of x86-64 CPUs (Haswell 2013+, Zen 1+)
    - **X86V4 (AVX-512)**: Optional - CPUs often optimize AVX2 to AVX-512 in microcode
    - **NeonFp16**: ARM with half-precision support (Apple Silicon, newer ARM servers)
 
-2. **Never use `unsafe` for loads/stores** - use `archmage::mem::*` wrappers:
-   ```rust
-   // ❌ WRONG
-   let v = unsafe { _mm256_loadu_ps(data.as_ptr()) };
-
-   // ✅ CORRECT
-   let v = avx::_mm256_loadu_ps(token, data);
-   ```
-
-3. **Use `Desktop64` as your baseline** - it's X86V3 (AVX2+FMA):
+4. **Use `Desktop64` as your baseline** - it's X86V3 (AVX2+FMA):
    ```rust
    #[arcane]
-   fn dct_8x8<T: HasAvx2 + HasFma>(token: T, block: &mut [f32; 64]) {
+   fn dct_8x8(_token: impl Has256BitSimd, block: &mut [f32; 64]) {
        // Works with Desktop64, covers nearly all modern x86
    }
    ```
 
-4. **Test scalar fallbacks** with `ARCHMAGE_DISABLE=1 cargo test`
+5. **Test scalar fallbacks** with `ARCHMAGE_DISABLE=1 cargo test`
 
-5. **Simple dispatch pattern** (AVX-512 often not worth the complexity):
+6. **Simple dispatch pattern**:
    ```rust
-   use archmage::{Desktop64, NeonFp16Token, SimdToken};
+   use archmage::{Desktop64, NeonToken, SimdToken};
 
    pub fn process(data: &mut [f32]) {
        if let Some(t) = Desktop64::summon() {
            process_avx2(t, data);
-       } else if let Some(t) = NeonFp16Token::summon() {
+       } else if let Some(t) = NeonToken::summon() {
            process_neon(t, data);
        } else {
            process_scalar(data);
