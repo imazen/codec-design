@@ -414,9 +414,9 @@ fn process_row(data: &mut [f32]) {
 }
 ```
 
-**Limitation:** `wide` uses `cfg(target_feature)` (compile-time check), NOT runtime detection. When distributed without `-C target-cpu=x86-64-v3`, it compiles to the lowest common denominator (SSE2/SSE4.1).
+**Note:** `wide` usually autovectorizes well inside `#[multiversed]` functions - LLVM can optimize `f32x8` operations to use wider registers when the function has `#[target_feature]` enabled. Occasionally specific `wide` intrinsic choices don't re-autovectorize; profile to identify these cases.
 
-**Workaround with `#[multiversed]`:** Place the dispatch macro at a high level, outside the loop, with `wide` usage in `#[inline(always)]` inner functions:
+**Best practice with `#[multiversed]`:** Place the dispatch macro at a high level, outside the loop, with `wide` usage in `#[inline(always)]` inner functions:
 
 ```rust
 use multiversioned::multiversioned;
