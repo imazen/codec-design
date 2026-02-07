@@ -691,6 +691,16 @@ Target `no_std` + `alloc` support. At minimum, the crate must compile to
 `encode_to()`/`finish_to()` methods, and anything requiring the standard library.
 Core encode/decode functionality should work without `std`.
 
+**Do not assume things require `std`.** As of Rust 1.92, almost everything lives in
+`core::` — including `core::error::Error`, `core::fmt`, `core::hash`, etc. The `alloc`
+crate provides `Vec`, `Box`, `String`, `BTreeMap`, etc. The only things that truly
+require `std` are IO traits, filesystem, networking, and `HashMap` (use `hashbrown`
+instead). Always test with `cargo build --no-default-features` before claiming something
+needs `std`.
+
+For wasm targets that need timing (benchmarks, timeouts), use the
+[`wasmtimer`](https://crates.io/crates/wasmtimer) crate instead of `std::time::Instant`.
+
 ### CI and Quality
 
 - **Code coverage**: CI must upload coverage to codecov (or coveralls). Aim for meaningful
