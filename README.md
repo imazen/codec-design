@@ -711,6 +711,44 @@ For wasm targets that need timing (benchmarks, timeouts), use the
   basic encode and decode usage. These should be `rust` doc-tested or have equivalent
   integration tests to prevent bitrot.
 
+### Threat Model: Malicious Input on Real-Time Proxies
+
+These codecs run on image proxies that process untrusted input in real time. Every
+decode path is an attack surface. Design accordingly:
+
+- **Assume every input is adversarial.** Fuzzed, hand-crafted, or corrupted images
+  must never cause panics, OOM, infinite loops, or disproportionate CPU usage.
+- **Bound everything.** Memory, CPU time, output dimensions, decompression ratio.
+  Limits must be checked before allocation, not after.
+- **No amplification.** A 1KB input must not produce 1GB of memory usage or 10 seconds
+  of CPU time. Track decompression ratio and abort on suspicious expansion.
+
+### Fuzzing
+
+Every codec must have `cargo-fuzz` targets covering at minimum:
+- **Decode fuzzer**: arbitrary bytes → decoder (the primary attack surface)
+- **Roundtrip fuzzer**: encode → decode, verify consistency
+- **Limits fuzzer**: verify Limits enforcement under adversarial input
+- **Streaming fuzzer**: feed bytes incrementally in random chunk sizes
+
+Fuzz targets should be run regularly (not just once). CI should build fuzz targets
+to prevent bitrot. Seed corpora should include known-tricky images and prior crash cases.
+
+### Periodic Security Audits
+
+Schedule periodic deep-dive reviews (not just fuzzing) specifically looking for:
+- **DoS vectors**: inputs that cause O(n²) or worse behavior, hash flooding, excessive
+  backtracking, or algorithmic complexity attacks
+- **Memory amplification**: small inputs that trigger large allocations (zip bombs,
+  decompression bombs, palette expansion, huge dimensions with tiny compressed data)
+- **Worst-case performance paths**: inputs that hit pathological cases in entropy
+  decoding, LZW, Huffman tree construction, or color conversion
+- **Integer overflow**: dimension multiplication, stride calculation, buffer size computation
+- **Infinite loops**: malformed headers that cause parsers to loop without progress
+
+Document findings in each codec's CLAUDE.md under "Known Bugs" or "Security Notes".
+Fix critical issues immediately; track others with severity ratings.
+
 ## Anti-Patterns
 
 ### 1. Giant Constructor
@@ -837,6 +875,8 @@ encoder.finish()?;   // Streaming: completing what was started
 - [ ] CI with codecov coverage upload
 - [ ] README badges (build, crates.io, docs.rs, coverage, license)
 - [ ] README usage examples (doc-tested or integration-tested)
+- [ ] Fuzz targets: decode, roundtrip, limits, streaming
+- [ ] Safe for malicious input on real-time proxies (bounded memory/CPU, no amplification)
 
 ---
 
