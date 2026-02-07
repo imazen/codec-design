@@ -713,6 +713,25 @@ needs `std`.
 For wasm targets that need timing (benchmarks, timeouts), use the
 [`wasmtimer`](https://crates.io/crates/wasmtimer) crate instead of `std::time::Instant`.
 
+### Licensing
+
+Our codecs (zenjpeg, zenwebp, zengif, zenavif) are dual-licensed: AGPL v3 / Commercial.
+External crates (png, ravif, moxcms) have their own licenses — respect them.
+
+Every codec README must include:
+
+> ## License
+>
+> Sustainable, large-scale open source work requires a funding model, and I have been
+> doing this full-time for 15 years. If you are using this for closed-source development
+> AND make over $1 million per year, you'll need to buy a commercial license at
+> https://www.imazen.io/pricing
+>
+> Commercial licenses are similar to the Apache 2 license but company-specific, and on
+> a sliding scale. You can also use this under the AGPL v3.
+
+Cargo.toml should use `license = "AGPL-3.0-or-later"` for our codecs.
+
 ### CI and Quality
 
 - **Code coverage**: CI must upload coverage to codecov (or coveralls). Aim for meaningful
