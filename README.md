@@ -12,6 +12,15 @@ production codecs including [zenjpeg](https://github.com/imazen/zenjpeg) and
 4. **Resource estimation before work** — memory and compute cost prediction
 5. **Cooperative cancellation** — long operations should be interruptible
 6. **Layered complexity** — simple things simple, complex things possible
+7. **One obvious way** — prefer a single correct path over multiple equivalent entry points
+8. **Forwards-compatible surface** — implementations will change; minimize API surface so internals can evolve without breaking callers
+
+Principles 7 and 8 work together: every public function is a commitment. Duplicate
+entry points that do the same thing (e.g., `encode()` and `encode_image()` and
+`encode_pixels()`) create maintenance burden, confuse callers, and constrain future
+changes. If two methods differ only in convenience, keep the general one and add a
+single shortcut at most. When in doubt, leave it out — it's easy to add API surface
+later, impossible to remove it.
 
 ---
 
