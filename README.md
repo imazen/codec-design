@@ -22,6 +22,13 @@ changes. If two methods differ only in convenience, keep the general one and add
 single shortcut at most. When in doubt, leave it out — it's easy to add API surface
 later, impossible to remove it.
 
+**Avoid free functions.** Functionality belongs on types (Config, Request, Decoder),
+not as module-level `decode_rgba()` / `decode_rgb()` / `decode_bgra()` functions that
+proliferate with every new pixel format. A single method on a type with a layout
+parameter scales better than N free functions. Free functions also can't accept
+limits, cancellation, or config — callers outgrow them immediately and must learn the
+real API anyway.
+
 ---
 
 ## Three-Layer Architecture
@@ -354,21 +361,20 @@ let request = config.encode_request(w, h, layout)
 
 ### Layered API
 
-Provide both simple functions and a request builder for advanced use:
+Use the config/request path for all decoding. Avoid free functions — they can't
+accept limits, cancellation, or config, and proliferate with every pixel format.
 
 ```rust
-// Simple one-shot functions
-pub fn decode_rgba(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
-pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
+// Simple (DecoderConfig::new() uses sensible defaults)
+let image = DecoderConfig::new().decode(data, PixelLayout::Rgba8)?;
 
-// Request builder for advanced options
-let request = DecoderConfig::new()
+// Full control
+let image = DecoderConfig::new()
     .decode_request(data)
     .with_output_layout(PixelLayout::Rgba8)
     .with_limits(&limits)
-    .with_stop(&cancel);
-
-let image = request.decode()?;
+    .with_stop(&cancel)
+    .decode()?;
 ```
 
 ### Probing: Info Before Decode
@@ -528,17 +534,14 @@ impl StreamingDecoder {
 ### Decode to Multiple Formats
 
 ```rust
-// Via PixelLayout on request
+// Via PixelLayout on request — one method, any format
 let rgba = config.decode_request(data).with_output_layout(PixelLayout::Rgba8).decode()?;
 let bgra = config.decode_request(data).with_output_layout(PixelLayout::Bgra8).decode()?;
 let yuv  = config.decode_request(data).with_output_layout(PixelLayout::Yuv420).decode()?;
-
-// Or convenience functions
-pub fn decode_rgba(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
-pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
-pub fn decode_bgra(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
-pub fn decode_yuv420(data: &[u8]) -> Result<YuvPlanes>;
 ```
+
+No free functions like `decode_rgba()` / `decode_bgra()` — they proliferate with
+every pixel format and can't accept limits or cancellation.
 
 ---
 
@@ -864,7 +867,7 @@ encoder.finish()?;   // Streaming: completing what was started
 
 ### Decoder
 - [ ] Three-layer: Config → Request → Decoder
-- [ ] Simple one-shot convenience functions for basic use
+- [ ] Simple one-shot via config method (not free functions)
 - [ ] DecodeRequest specifies desired output format (enables internal optimization)
 - [ ] Info retrieval before decode
 - [ ] Zero-copy decode_into variants
