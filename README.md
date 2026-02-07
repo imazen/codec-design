@@ -669,6 +669,38 @@ archmage = "0.5"         # Token-based safe SIMD dispatch
 
 ---
 
+## Project Standards
+
+### No Legacy APIs
+
+We have no external users — all dependents on crates.io are owned by us. When making
+breaking changes, just bump the 0.x version. Do not waste time on deprecation shims,
+`#[deprecated]` aliases, or backwards-compatible wrappers. Delete the old API and move on.
+
+### Safety: `#![forbid(unsafe_code)]`
+
+All crates must use `#![forbid(unsafe_code)]` with the default feature set. SIMD code
+goes through `archmage` (which generates unsafe internally via proc macros, bypassing
+the lint). An optional `unchecked` feature may relax this for performance-critical paths
+with trusted input, but the default build must be safe.
+
+### no_std + alloc
+
+Target `no_std` + `alloc` support. At minimum, the crate must compile to
+`wasm32-unknown-unknown`. The `std` feature gates IO traits (`Read`, `Write`),
+`encode_to()`/`finish_to()` methods, and anything requiring the standard library.
+Core encode/decode functionality should work without `std`.
+
+### CI and Quality
+
+- **Code coverage**: CI must upload coverage to codecov (or coveralls). Aim for meaningful
+  coverage of encode/decode paths, not vanity percentage.
+- **README badges**: Build status, crates.io version, docs.rs, coverage, license — at the
+  top of every README.
+- **README usage examples**: Every crate README must include working code examples showing
+  basic encode and decode usage. These should be `rust` doc-tested or have equivalent
+  integration tests to prevent bitrot.
+
 ## Anti-Patterns
 
 ### 1. Giant Constructor
@@ -787,9 +819,14 @@ encoder.finish()?;   // Streaming: completing what was started
 - [ ] `At<>` error wrapping for location tracking
 - [ ] Separate `EncodeError` / `DecodeError` types
 - [ ] Feature flags for optional functionality
-- [ ] no_std + alloc support (std opt-in for IO)
+- [ ] `#![forbid(unsafe_code)]` with default features
+- [ ] no_std + alloc support (minimum: wasm32 target)
 - [ ] `EncodeStats` / allocation tracking
 - [ ] Resource estimation on config, Limits enforcement on request
+- [ ] No legacy/deprecated API shims — just bump 0.x version
+- [ ] CI with codecov coverage upload
+- [ ] README badges (build, crates.io, docs.rs, coverage, license)
+- [ ] README usage examples (doc-tested or integration-tested)
 
 ---
 
