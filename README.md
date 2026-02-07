@@ -1,108 +1,190 @@
 # Image Codec API Design Guidelines
 
-Best practices for designing image encoder and decoder APIs in Rust, distilled from production codecs including [jpegli-rs](https://github.com/imazen/jpegli-rs) and [webpx](https://github.com/imazen/webpx).
+Best practices for designing image encoder and decoder APIs in Rust, distilled from
+production codecs including [zenjpeg](https://github.com/imazen/zenjpeg) and
+[zenwebp](https://github.com/imazen/zenwebp).
 
 ## Core Principles
 
-1. **Config-first, dimensions-second** - Configuration should be reusable across images
-2. **Required parameters via constructors, optionals via builders** - No `Default` for configs with required semantics
-3. **Multiple entry points for different use cases** - One-shot, streaming, zero-copy
-4. **Resource estimation before work** - Memory and compute cost prediction
-5. **Cooperative cancellation** - Long operations should be interruptible
-6. **Layered complexity** - Simple things simple, complex things possible
+1. **Config-first, dimensions-second** — configuration should be reusable across images
+2. **Required parameters via constructors, optionals via builders** — no `Default` for configs with required semantics
+3. **Three-layer architecture** — Config → Request → Encoder/Decoder
+4. **Resource estimation before work** — memory and compute cost prediction
+5. **Cooperative cancellation** — long operations should be interruptible
+6. **Layered complexity** — simple things simple, complex things possible
+
+---
+
+## Three-Layer Architecture
+
+Every codec should follow this layering:
+
+```
+Layer 1: EncoderConfig     — HOW to encode. Reusable, Clone, no borrows.
+                             Quality, effort, subsampling, progressive, etc.
+
+Layer 2: EncodeRequest<'a> — WHAT to encode and WHERE. Borrows everything.
+                             Pixel format, dimensions, metadata, gain maps,
+                             auxiliary streams, limits, stop token.
+                             This is the contract the encoder optimizes against.
+
+Layer 3: Encoder           — Internal state machine. For streaming only.
+                             Created by request.build(). Caller pushes rows/frames.
+                             One-shot callers never see this — request.encode() hides it.
+```
+
+Same pattern for decode:
+
+```
+Layer 1: DecoderConfig     — HOW to decode. Upsampling, color management.
+Layer 2: DecodeRequest<'a> — WHAT to decode and desired output format.
+                             Knowing output format upfront lets decoder skip conversions.
+Layer 3: Decoder           — Internal state machine for streaming output.
+```
+
+### Why the intermediate matters
+
+The encoder/decoder needs the FULL picture before starting work:
+- **Pixel format known upfront** → pick internal pipeline (YUV vs RGB, u8 vs f32 path)
+- **Metadata before pixels** → headers must be written first in streaming
+- **Output format before decode** → skip YUV→RGB if caller wants YUV
+- **Gain maps / aux streams declared upfront** → allocate appropriate buffers
+- **Limits before any work** → fail fast on oversized input
+
+### Intermediate layers can be factored
+
+`EncodeRequest` doesn't have to be monolithic. Codecs can factor it into helper types
+for complex input configurations. For example, metadata gets its own struct rather than
+crowding the request with individual ICC/EXIF/XMP fields.
 
 ---
 
 ## Encoder Design
 
-### Config Structure
+### Config Structure: Separate Lossy and Lossless
+
+For codecs that support both lossy and lossless, use separate config types so
+invalid combinations are unrepresentable at compile time:
 
 ```rust
-/// Dimension-independent, reusable encoder configuration.
-///
-/// No Default impl - quality and color mode are semantic requirements.
-pub struct EncoderConfig {
+/// Lossy-specific parameters. Can't accidentally set lossless options.
+#[derive(Clone, Debug)]
+pub struct LossyConfig {
     quality: Quality,
-    color_mode: ColorMode,
-    // ... optional settings with sensible defaults
+    // ... lossy-specific: subsampling, sharp_yuv, SNS, filter, etc.
+}
+
+/// Lossless-specific parameters. Can't accidentally set quality.
+#[derive(Clone, Debug)]
+pub struct LosslessConfig {
+    // ... lossless-specific: near_lossless level, exact mode, etc.
 }
 ```
 
-**Why no `Default`?** Quality and color mode represent fundamental encoding decisions. Forcing explicit choice prevents accidental low-quality output or wrong color space.
+**Why separate types?** `LossyConfig::new(85).near_lossless(60)` shouldn't compile.
+Quality is meaningless for lossless. Near-lossless is meaningless for lossy. Shared
+parameters like `method`/`effort` (speed/quality tradeoff) appear on both types.
+
+**Both produce the same EncodeRequest, and offer fluent shortcuts:**
+```rust
+impl LossyConfig {
+    // Full control: returns request for metadata/limits/stop/streaming
+    pub fn encode_request(&self, w: u32, h: u32, layout: PixelLayout) -> EncodeRequest;
+
+    // Fluent shortcut: config → bytes (request created internally)
+    pub fn encode(&self, pixels: &[u8], w: u32, h: u32, layout: PixelLayout) -> Result<Vec<u8>>;
+    pub fn encode_into(&self, pixels: &[u8], w: u32, h: u32, layout: PixelLayout, out: &mut Vec<u8>) -> Result<()>;
+}
+// Same for LosslessConfig
+```
+
+```rust
+// Simple — one line, no request visible
+let webp = LossyConfig::new(85.0).with_method(4)
+    .encode(&pixels, w, h, PixelLayout::Rgba8)?;
+
+// Full control — request layer for metadata, limits, cancellation
+let webp = LossyConfig::new(85.0).with_method(4)
+    .encode_request(w, h, PixelLayout::Rgba8)
+    .with_metadata(&meta)
+    .with_limits(&limits)
+    .with_stop(&cancel)
+    .encode(&pixels)?;
+```
+
+**When NOT to split:** Codecs that only support one mode don't need it.
+JPEG is lossy-only — just use `EncoderConfig`. GIF is palette-based — just use
+`EncoderConfig`. Split only when both modes exist AND have distinct parameter sets.
 
 ### Constructor Variants (Not Generic New)
 
+For lossy codecs with multiple color modes, use variant constructors:
+
 ```rust
-impl EncoderConfig {
-    /// YCbCr mode - standard, maximum compatibility
+impl LossyConfig {
+    /// YCbCr mode — standard, maximum compatibility
     pub fn ycbcr(quality: impl Into<Quality>, subsampling: ChromaSubsampling) -> Self;
 
-    /// XYB mode - perceptual color space, better quality/size
+    /// XYB mode — perceptual color space, better quality/size
     pub fn xyb(quality: impl Into<Quality>, b_subsampling: XybSubsampling) -> Self;
 
-    /// Grayscale mode - single channel
+    /// Grayscale mode — single channel
     pub fn grayscale(quality: impl Into<Quality>) -> Self;
 }
 ```
 
-**Why variant constructors?**
-- Makes the color mode decision explicit and visible
-- Different modes may have different required parameters (subsampling type varies)
-- Self-documenting: `EncoderConfig::ycbcr(85, ChromaSubsampling::Quarter)` vs `EncoderConfig::new().color_mode(ColorMode::YCbCr).subsampling(...)`
+Makes the color mode decision explicit and visible. Different modes may have different
+required parameters (subsampling type varies by mode).
 
-### Builder Pattern for Optionals
+**No `Default` on configs with required semantics.** Quality and color mode represent
+fundamental encoding decisions. A default quality of 75 silently produces mediocre
+output. Make callers choose.
 
-```rust
-impl EncoderConfig {
-    pub fn progressive(mut self, enable: bool) -> Self { ... }
-    pub fn optimize_huffman(mut self, enable: bool) -> Self { ... }
-    pub fn icc_profile(mut self, profile: impl Into<Vec<u8>>) -> Self { ... }
-    pub fn sharp_yuv(mut self, enable: bool) -> Self { ... }
-}
+### Builder/Getter Conventions: `with_` setters, bare-name getters
 
-// Usage
-let config = EncoderConfig::ycbcr(85, ChromaSubsampling::Quarter)
-    .progressive(true)
-    .sharp_yuv(true);
-```
+Use `with_` prefix for consuming builder setters, bare names for getters. This
+eliminates ambiguity (`config.progressive()` is always a getter, never a setter).
 
-### Multiple Entry Points
-
-Provide encoder creation for different input scenarios:
+| Type | Setters | Getters | Rationale |
+|------|---------|---------|-----------|
+| **Config** | `with_foo(mut self, val) -> Self` | `foo(&self) -> T` | Owned, chainable from constructor. Getters allow inspection. |
+| **Request** | `with_foo(mut self, val) -> Self` | None (transient) | Consumed by `encode()`/`build()`. No need to read back. |
+| **Encoder/Decoder** | `&mut self` methods (`push`, `add_frame`) | `&self` methods (`info`, `stats`) | Not builders — mutation and queries are separate. |
+| **ImageMetadata** | `with_foo(mut self, val) -> Self` | `foo(&self) -> Option<T>` | Small struct, builder + inspection both useful. |
 
 ```rust
-impl EncoderConfig {
-    /// Raw bytes with explicit layout
-    pub fn encode_from_bytes(&self, w: u32, h: u32, layout: PixelLayout) -> Result<BytesEncoder>;
+// Config: with_ setters, bare-name getters
+let config = LossyConfig::ycbcr(85, ChromaSubsampling::Quarter)
+    .with_progressive(true)
+    .with_sharp_yuv(true);
+assert!(config.progressive());
+assert_eq!(config.subsampling(), ChromaSubsampling::Quarter);
 
-    /// Typed pixels (rgb crate types)
-    pub fn encode_from_rgb<P: Pixel>(&self, w: u32, h: u32) -> Result<RgbEncoder<P>>;
+// Request: with_ setters, no getters (consumed immediately)
+let request = config.encode_request(w, h, PixelLayout::Rgba8)
+    .with_metadata(&meta)
+    .with_limits(&limits)
+    .with_stop(&cancel);
+request.encode(&pixels)?;
 
-    /// Pre-converted planar YCbCr (video pipelines)
-    pub fn encode_from_ycbcr_planar(&self, w: u32, h: u32) -> Result<YCbCrPlanarEncoder>;
-}
+// Encoder/Decoder: &mut self mutation, &self inspection
+encoder.push(&data, rows, stride)?;
+let stats = encoder.stats();
+let info = decoder.info();
+
+// ImageMetadata: with_ setters, bare-name getters
+let meta = ImageMetadata::new()
+    .with_icc_profile(&icc)
+    .with_exif(&exif);
+assert!(meta.icc_profile().is_some());
 ```
 
-### Streaming Push API
+**Why not bare-name setters?** `config.progressive(true)` looks like a getter call
+with a stray argument. `config.progressive()` is ambiguous — getter or setter with
+default `true`? The `with_` prefix makes intent unambiguous at every call site.
 
-For memory efficiency with large images:
-
-```rust
-pub trait Encoder {
-    /// Push rows of pixel data
-    fn push_packed(&mut self, data: &[u8], stop: impl Stop) -> Result<()>;
-
-    /// Finish encoding, return output
-    fn finish(self) -> Result<Vec<u8>>;
-}
-
-// Usage
-let mut enc = config.encode_from_bytes(1920, 1080, PixelLayout::Rgb8Srgb)?;
-for chunk in pixel_chunks {
-    enc.push_packed(&chunk, Unstoppable)?;
-}
-let jpeg = enc.finish()?;
-```
+**Why not `set_` prefix?** `set_foo(&mut self)` implies borrow-based mutation, not
+consuming builders. It also doesn't chain from constructors without `let mut`.
 
 ### Resource Estimation
 
@@ -125,35 +207,102 @@ if ceiling > available_memory {
 }
 ```
 
-### Cooperative Cancellation
+Estimation is prediction (before work). Limits are enforcement (during work). Both needed.
 
-Long operations should be interruptible:
+### Encode Request (Intermediate Layer)
 
 ```rust
-/// Re-export from `enough` crate
-pub use enough::{Stop, Unstoppable};
+pub struct EncodeRequest<'a> { /* ... */ }
 
-// In encoder
-fn push_packed(&mut self, data: &[u8], stop: impl Stop) -> Result<()> {
-    for block in blocks {
-        stop.check()?;  // Check for cancellation
-        self.encode_block(block);
-    }
-    Ok(())
+impl<'a> EncodeRequest<'a> {
+    pub fn new(
+        config: &'a EncoderConfig,
+        width: u32,
+        height: u32,
+        pixel_layout: PixelLayout,
+    ) -> Self;
+
+    // Metadata (factored into its own struct)
+    pub fn with_metadata(self, meta: &'a ImageMetadata<'a>) -> Self;
+
+    // Auxiliary streams
+    pub fn with_gain_map(self, input: GainMapInput<'a>) -> Self;
+
+    // Controls
+    pub fn with_limits(self, limits: &'a Limits) -> Self;
+    pub fn with_stop(self, stop: &'a dyn Stop) -> Self;
+
+    // One-shot — "encode" not "finish" (nothing was started)
+    pub fn encode(self, pixels: &[u8]) -> Result<Vec<u8>>;
+    pub fn encode_into(self, pixels: &[u8], out: &mut Vec<u8>) -> Result<()>;
+    #[cfg(feature = "std")]
+    pub fn encode_to(self, pixels: &[u8], dest: impl Write) -> Result<()>;
+
+    // Streaming — request produces encoder
+    pub fn build(self) -> Result<Encoder<'a>>;
+}
+```
+
+### Metadata Struct
+
+ICC profiles, EXIF, and XMP are per-image data that belongs with the encode request,
+not on the reusable config. Factor into a struct to keep the request clean:
+
+```rust
+#[derive(Clone, Debug, Default)]
+pub struct ImageMetadata<'a> {
+    pub icc_profile: Option<&'a [u8]>,
+    pub exif: Option<&'a [u8]>,
+    pub xmp: Option<&'a [u8]>,
 }
 
-// Usage with timeout
-let cancel = Arc::new(AtomicBool::new(false));
-// In another thread: cancel.store(true, Ordering::Relaxed);
-enc.push_packed(&data, &cancel)?;
+impl<'a> ImageMetadata<'a> {
+    pub fn new() -> Self { Self::default() }
+    pub fn with_icc_profile(mut self, icc: &'a [u8]) -> Self { self.icc_profile = Some(icc); self }
+    pub fn with_exif(mut self, exif: &'a [u8]) -> Self { self.exif = Some(exif); self }
+    pub fn with_xmp(mut self, xmp: &'a [u8]) -> Self { self.xmp = Some(xmp); self }
+}
 ```
+
+### Streaming Push API
+
+For memory efficiency with large images:
+
+```rust
+pub struct Encoder<'a> { /* ... */ }
+
+impl<'a> Encoder<'a> {
+    /// Push rows of pixel data
+    pub fn push(&mut self, data: &[u8], rows: usize, stride: usize) -> Result<()>;
+
+    /// Push frames (multi-frame codecs: GIF, animated WebP/JXL)
+    pub fn add_frame(&mut self, frame: FrameInput) -> Result<()>;
+
+    /// Streaming completion — "finish" because pushing was "started"
+    pub fn finish(self) -> Result<Vec<u8>>;
+    pub fn finish_into(self, out: &mut Vec<u8>) -> Result<()>;
+    #[cfg(feature = "std")]
+    pub fn finish_to(self, dest: impl Write) -> Result<()>;
+
+    pub fn stats(&self) -> &EncodeStats;
+}
+```
+
+### Naming: encode() vs finish()
+
+- **One-shot** (EncodeRequest): `encode()`, `encode_into()`, `encode_to()`
+  Nothing was "started" — you're doing the whole operation.
+- **Streaming** (Encoder): `finish()`, `finish_into()`, `finish_to()`
+  You pushed rows/frames, now you're completing the stream.
+
+Do NOT use `finish()` for one-shot (nothing was "started") or `encode()` for streaming.
 
 ### Quality Abstraction
 
 Support multiple quality scales:
 
 ```rust
-#[derive(Clone, Copy)]
+#[non_exhaustive]
 pub enum Quality {
     /// Native quality scale (0-100)
     ApproxJpegli(f32),
@@ -169,10 +318,25 @@ pub enum Quality {
 impl From<u8> for Quality { ... }
 impl From<f32> for Quality { ... }
 
-// Usage - all equivalent ways to specify quality
+// All equivalent ways to specify quality
 let config = EncoderConfig::ycbcr(85, ...);                        // u8 -> ApproxJpegli
-let config = EncoderConfig::ycbcr(85.0, ...);                      // f32 -> ApproxJpegli
 let config = EncoderConfig::ycbcr(Quality::ApproxMozjpeg(80), ...);
+```
+
+### Cooperative Cancellation
+
+`&dyn Stop` preferred over `S: Stop` generic or `impl Stop` per push:
+- No type parameter pollution (`Encoder<'a>` not `Encoder<'a, S>`)
+- Vtable cost negligible — cancellation checked a few times per MB
+- `&Unstoppable` when caller doesn't care
+
+```rust
+/// Re-export from `enough` crate
+pub use enough::{Stop, Unstoppable};
+
+// Set once on request, checked throughout encoding
+let request = config.encode_request(w, h, layout)
+    .with_stop(&cancel_flag);
 ```
 
 ---
@@ -181,50 +345,131 @@ let config = EncoderConfig::ycbcr(Quality::ApproxMozjpeg(80), ...);
 
 ### Layered API
 
-Provide both simple functions and a builder for advanced use:
+Provide both simple functions and a request builder for advanced use:
 
 ```rust
 // Simple one-shot functions
 pub fn decode_rgba(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
 pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
 
-// Typed pixel output
-pub fn decode<P: DecodePixel>(data: &[u8]) -> Result<(Vec<P>, u32, u32)>;
+// Request builder for advanced options
+let request = DecoderConfig::new()
+    .decode_request(data)
+    .with_output_layout(PixelLayout::Rgba8)
+    .with_limits(&limits)
+    .with_stop(&cancel);
 
-// Builder for advanced options
-pub struct Decoder<'a> { ... }
-
-impl<'a> Decoder<'a> {
-    pub fn new(data: &'a [u8]) -> Result<Self>;
-    pub fn info(&self) -> &ImageInfo;
-    pub fn crop(self, left: u32, top: u32, w: u32, h: u32) -> Self;
-    pub fn scale(self, w: u32, h: u32) -> Self;
-    pub fn decode_rgba(self) -> Result<ImgVec<RGBA8>>;
-}
+let image = request.decode()?;
 ```
 
-### Info Before Decode
+### Probing: Info Before Decode
 
-Allow inspection without full decode:
+Two patterns, both avoiding double-parsing and double-buffering:
+
+#### Static probe (when you have bytes available)
 
 ```rust
 pub struct ImageInfo {
     pub width: u32,
     pub height: u32,
     pub has_alpha: bool,
-    pub format: ImageFormat,
+    pub format: BitstreamFormat,
+    // format-specific fields
 }
 
 impl ImageInfo {
-    pub fn from_webp(data: &[u8]) -> Result<Self>;
+    /// Minimum bytes needed to attempt header parsing.
+    /// For fixed-header formats (WebP, GIF, JXL) this is exact.
+    /// For variable-header formats (JPEG) this is a typical minimum —
+    /// from_bytes() may return NeedMoreData if SOF hasn't appeared yet.
+    pub const PROBE_BYTES: usize = 4096;  // format-specific
+
+    /// Parse header from a byte slice. Returns NeedMoreData if
+    /// the header is incomplete (variable-length formats).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ProbeError>;
 }
 
-// Usage
-let info = ImageInfo::from_webp(&data)?;
-if info.width * info.height > MAX_PIXELS {
-    return Err("image too large");
+pub enum ProbeError {
+    NeedMoreData,        // not enough bytes yet
+    InvalidFormat,       // not this format at all
+    Corrupt(String),     // header present but malformed
 }
-let (pixels, _, _) = decode_rgba(&data)?;
+
+// Usage with a slice
+let info = ImageInfo::from_bytes(&first_4k)?;
+if info.width as u64 * info.height as u64 > max_pixels {
+    return Err("too large");
+}
+```
+
+#### Streaming probe (parse header, pause, continue decoding)
+
+The decoder itself has a two-phase API: build parses the header, then you
+inspect info before committing to decode. No re-parsing, no double-buffering.
+
+```rust
+// Phase 1: Build decoder — parses header, stops before pixel decode
+let mut decoder = DecodeRequest::new(&config, &data)
+    .with_limits(&limits)
+    .build()?;
+
+// Phase 2: Inspect — header already parsed during build()
+let info = decoder.info();
+if info.width > 8192 { return Err("too wide"); }
+
+// Phase 3: Continue — decodes from where it left off
+let output = decoder.decode()?;
+```
+
+For incremental network streams:
+
+```rust
+let mut stream = StreamingDecoder::new();
+
+// Feed bytes as they arrive
+stream.append(&chunk1)?;  // → NeedMoreData
+stream.append(&chunk2)?;  // → HeaderReady
+
+// Inspect without re-parsing
+let info = stream.info()?;  // available once HeaderReady
+
+// Decision point: proceed or abort
+stream.append(&chunk3)?;  // → NeedMoreData
+stream.append(&chunk4)?;  // → Complete
+
+// Finish — no double-buffering, decoder already has everything
+let (pixels, w, h) = stream.finish_rgba()?;
+```
+
+**Key invariant:** Once the header is parsed (during `build()` or after
+`HeaderReady`), the decoder holds the parse state. Calling `decode()` or
+`finish_*()` continues from that state. The header bytes are never re-read.
+
+### Decode Request (Intermediate Layer)
+
+Telling the decoder the desired output format BEFORE it starts lets it skip
+unnecessary conversions (e.g., skip YUV→RGB if caller wants YUV):
+
+```rust
+pub struct DecodeRequest<'a> { /* ... */ }
+
+impl<'a> DecodeRequest<'a> {
+    pub fn new(config: &'a DecoderConfig, data: &'a [u8]) -> Self;
+
+    // Desired output — lets decoder optimize internal pipeline
+    pub fn with_output_layout(self, layout: PixelLayout) -> Self;
+
+    // Controls
+    pub fn with_limits(self, limits: &'a Limits) -> Self;
+    pub fn with_stop(self, stop: &'a dyn Stop) -> Self;
+
+    // One-shot
+    pub fn decode(self) -> Result<DecodeOutput>;
+    pub fn decode_into(self, output: &mut [u8]) -> Result<ImageInfo>;
+
+    // Streaming
+    pub fn build(self) -> Result<Decoder<'a>>;
+}
 ```
 
 ### Zero-Copy Decode Into
@@ -233,68 +478,57 @@ For performance-critical paths:
 
 ```rust
 /// Decode directly into pre-allocated buffer
-pub fn decode_rgba_into(
+pub fn decode_into(
     data: &[u8],
     output: &mut [u8],
-    stride_bytes: u32
-) -> Result<(u32, u32)>;
-
-/// Typed pixel version
-pub fn decode_into<P: DecodePixel>(
-    data: &[u8],
-    output: &mut [P],
-    stride_pixels: u32  // Note: stride unit matches buffer type
+    stride_bytes: u32,
 ) -> Result<(u32, u32)>;
 ```
-
-**Stride convention**: The stride unit should match the buffer type. Byte buffers use byte strides, pixel buffers use pixel strides.
 
 ### Streaming Decode
 
 For progressive display or memory-constrained environments:
 
 ```rust
-pub struct StreamingDecoder { ... }
+pub struct Decoder<'a> { /* ... */ }
 
-pub enum DecodeStatus {
-    Complete,
+pub enum StreamStatus {
     NeedMoreData,
-    Partial(u32),  // rows decoded so far
+    HeaderReady,
+    Complete,
 }
+
+impl<'a> Decoder<'a> {
+    pub fn info(&self) -> &ImageInfo;
+    pub fn next_frame(&mut self) -> Result<Option<Frame>>;
+}
+
+// Incremental input (network streams)
+pub struct StreamingDecoder { /* ... */ }
 
 impl StreamingDecoder {
-    pub fn new(color_mode: ColorMode) -> Result<Self>;
-    pub fn with_buffer(output: &mut [u8], stride: usize, mode: ColorMode) -> Result<Self>;
-    pub fn append(&mut self, data: &[u8]) -> Result<DecodeStatus>;
-    pub fn get_partial(&self) -> Option<(&[u8], u32, u32)>;
-    pub fn finish(self) -> Result<(Vec<u8>, u32, u32)>;
+    pub fn new() -> Self;
+    pub fn with_config(config: DecoderConfig) -> Self;
+    pub fn append(&mut self, data: &[u8]) -> Result<StreamStatus>;
+    pub fn info(&self) -> Result<ImageInfo>;
+    pub fn is_complete(&self) -> bool;
+    pub fn finish_rgba(self) -> Result<(Vec<u8>, u32, u32)>;
 }
-
-// Usage
-let mut decoder = StreamingDecoder::new(ColorMode::Rgba)?;
-for chunk in network_stream {
-    match decoder.append(&chunk)? {
-        DecodeStatus::Complete => break,
-        DecodeStatus::Partial(rows) => display_partial(decoder.get_partial()),
-        DecodeStatus::NeedMoreData => continue,
-        _ => {}  // future variants
-    }
-}
-let (pixels, w, h) = decoder.finish()?;
 ```
 
 ### Decode to Multiple Formats
 
-Support common pixel layouts:
-
 ```rust
-impl Decoder<'_> {
-    pub fn decode_rgba(self) -> Result<ImgVec<RGBA8>>;
-    pub fn decode_rgb(self) -> Result<ImgVec<RGB8>>;
-    pub fn decode_bgra(self) -> Result<ImgVec<BGRA8>>;  // Windows/GPU native
-    pub fn decode_bgr(self) -> Result<ImgVec<BGR8>>;   // OpenCV
-    pub fn decode_yuv(self) -> Result<YuvPlanes>;      // Video pipelines
-}
+// Via PixelLayout on request
+let rgba = config.decode_request(data).with_output_layout(PixelLayout::Rgba8).decode()?;
+let bgra = config.decode_request(data).with_output_layout(PixelLayout::Bgra8).decode()?;
+let yuv  = config.decode_request(data).with_output_layout(PixelLayout::Yuv420).decode()?;
+
+// Or convenience functions
+pub fn decode_rgba(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
+pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
+pub fn decode_bgra(data: &[u8]) -> Result<(Vec<u8>, u32, u32)>;
+pub fn decode_yuv420(data: &[u8]) -> Result<YuvPlanes>;
 ```
 
 ---
@@ -304,44 +538,107 @@ impl Decoder<'_> {
 ### Pixel Layout Enum
 
 ```rust
+#[non_exhaustive]
 pub enum PixelLayout {
-    Rgb8Srgb,      // 3 bytes, sRGB gamma
-    Bgr8Srgb,      // 3 bytes, BGR order (Windows)
-    Rgbx8Srgb,     // 4 bytes, 4th ignored
-    Bgrx8Srgb,     // 4 bytes, BGR, 4th ignored
-    Gray8Srgb,     // 1 byte grayscale
-    Rgb16Linear,   // 6 bytes, linear light
-    RgbF32Linear,  // 12 bytes, float linear (HDR)
-    YCbCr8,        // 3 bytes, pre-converted
+    // 8-bit sRGB
+    Rgb8,
+    Rgba8,
+    Bgr8,
+    Bgra8,
+    Gray8,
+    GrayAlpha8,
+
+    // 16-bit linear
+    Rgb16,
+    Rgba16,
+    Gray16,
+
+    // 32-bit float linear (0.0-1.0)
+    RgbF32,
+    RgbaF32,
+    GrayF32,
+
+    // Planar (JPEG, WebP internal)
+    Yuv420,
 }
 
 impl PixelLayout {
-    pub fn bytes_per_pixel(&self) -> usize;
-    pub fn is_linear(&self) -> bool;
-    pub fn has_alpha(&self) -> bool;
+    pub const fn bytes_per_pixel(&self) -> usize;
+    pub const fn is_linear(&self) -> bool;
+    pub const fn has_alpha(&self) -> bool;
 }
 ```
+
+Not every codec supports every layout. Request creation returns an error if the
+codec doesn't support the requested layout.
+
+**Generics permitted at boundary**: Use `PixelLayout` enum as the primary API to
+avoid monomorphizing the entire pipeline per pixel type. Generic convenience methods
+at the boundary are fine — they validate byte length, set the layout, and delegate:
+
+```rust
+impl<'a> EncodeRequest<'a> {
+    pub fn encode_rgb<P: Pixel>(self, pixels: &[P]) -> Result<Vec<u8>> {
+        let bytes = bytemuck::cast_slice(pixels);
+        self.encode(bytes)
+    }
+}
+```
+
+**Measure before deciding** on generics vs enum internally: build an example with
+1 pixel type vs 4 (RGB8, RGBA8, RGB16, RGBF32), compare binary size and compile time.
+
+### Minimum Layout Support: RGBA8 and BGRA8
+
+Every codec must support `Rgba8` and `Bgra8` for both encode and decode, regardless
+of whether the format natively supports alpha. This ensures callers can use a single
+pixel format across all codecs without branching.
+
+- **Decode**: If the format has no alpha channel (JPEG, lossy WebP), set alpha to 255
+  (fully opaque) in the output buffer.
+- **Encode**: If the format has no alpha channel, silently ignore the alpha bytes in
+  the input. Do not error.
+
+This applies to both one-shot and streaming APIs. Codecs that natively support alpha
+(PNG, lossless WebP, GIF, JXL) pass it through as-is.
+
+### Limits (Resource Enforcement)
+
+```rust
+/// All fields default to None (no limit).
+#[derive(Clone, Debug, Default)]
+pub struct Limits {
+    pub max_width: Option<u64>,
+    pub max_height: Option<u64>,
+    pub max_pixels: Option<u64>,        // width * height
+    pub max_memory_bytes: Option<u64>,
+}
+```
+
+- Both encoders AND decoders should accept optional Limits
+- Users cannot predict encoder memory — Limits are needed on both sides
+- `max_pixels` catches the real problem (1×10M and 3162×3162 use similar memory)
+- Estimation predicts cost (before work). Limits enforce bounds (during work). Both needed.
 
 ### Error Design
 
 ```rust
+/// Separate encode/decode errors — different operations have different failure modes.
 #[derive(Debug)]
-#[non_exhaustive]  // Allow adding variants without breaking changes
-pub enum Error {
-    InvalidInput(String),
-    InvalidConfig(String),
-    DecodeFailed(DecodingError),
-    EncodeFailed(EncodingError),
-    OutOfMemory,
-    Stopped(StopReason),  // Cooperative cancellation
+#[non_exhaustive]
+pub enum EncodeError {
+    InvalidInput { /* ... */ },
+    InvalidConfig { /* ... */ },
+    LimitExceeded { /* ... */ },
+    Cancelled,
+    Oom(TryReserveError),
+    #[cfg(feature = "std")]
     Io(std::io::Error),
+    // format-specific variants
 }
 
-pub type Result<T> = std::result::Result<T, At<Error>>;
-
-// Use whereat crate for location tracking
-use whereat::*;
-return Err(at!(Error::InvalidInput("buffer too small".into())));
+/// Use whereat crate for location tracking — invaluable for debugging codec issues.
+pub type Result<T> = core::result::Result<T, At<EncodeError>>;
 ```
 
 ### Feature Flags
@@ -352,325 +649,85 @@ return Err(at!(Error::InvalidInput("buffer too small".into())));
 default = ["decode", "encode"]
 decode = []
 encode = []
-std = []          # For no_std support
-streaming = []    # Incremental decode/encode
-animation = []    # Multi-frame support
-parallel = []     # Multi-threaded encoding
+std = []          // For io::Write support, encode_to()/finish_to()
+streaming = []    // Incremental decode/encode
+animation = []    // Multi-frame support
+parallel = []     // Multi-threaded encoding
 ```
 
 ### Essential Crates
 
-Use these crates for buffer handling and type safety:
-
 ```toml
 [dependencies]
-rgb = "0.8"       # Typed pixel structs (RGB8, RGBA8, etc.)
-imgref = "1.10"   # Strided 2D image views
-bytemuck = "1.14" # Safe transmute for [f32; 8] <-> &[f32]
-```
-
-**Why these matter:**
-
-- **`rgb`**: Provides `RGB<u8>`, `RGBA<f32>`, etc. with correct memory layout. Avoids manual channel indexing.
-- **`imgref`**: `ImgVec<P>` and `ImgRef<P>` support strided buffers, enabling `chunks_exact` iteration.
-- **`bytemuck`**: Safe casting between `&[f32]` and `&[[f32; 8]]` for SIMD chunk processing.
-
-```rust
-use imgref::ImgVec;
-use rgb::RGBA8;
-use bytemuck::cast_slice_mut;
-
-// Strided buffer enables efficient row iteration
-let img: ImgVec<RGBA8> = decode_rgba(&data)?;
-for row in img.rows() {
-    // Each row is contiguous, perfect for chunks_exact
-    for chunk in row.chunks_exact(8) {
-        process_8_pixels(chunk);
-    }
-}
-
-// Safe SIMD chunk casting
-let floats: &mut [f32] = &mut buffer;
-let chunks: &mut [[f32; 8]] = cast_slice_mut(floats);
+enough = "0.1"           # Cooperative cancellation (Stop trait)
+whereat = "0.1"          # Error location tracking (At<E>)
+rgb = "0.8"              # Typed pixel structs (RGB8, RGBA8, etc.)
+imgref = "1.10"          # Strided 2D image views
+bytemuck = "1.14"        # Safe transmute for pixel casting
+archmage = "0.5"         # Token-based safe SIMD dispatch
 ```
 
 ---
 
-## SIMD Strategy
-
-### The `wide` Crate (Portable SIMD)
-
-The [`wide`](https://crates.io/crates/wide) crate provides portable SIMD types (`f32x8`, `i32x8`, etc.) that help the compiler vectorize:
-
-```rust
-use wide::f32x8;
-
-fn process_row(data: &mut [f32]) {
-    for chunk in data.chunks_exact_mut(8) {
-        let v = f32x8::from(chunk);
-        let result = v * f32x8::splat(2.0) + f32x8::splat(1.0);
-        chunk.copy_from_slice(result.as_array_ref());
-    }
-}
-```
-
-**Note:** `wide` usually autovectorizes well inside `#[multiversed]` functions - LLVM can optimize `f32x8` operations to use wider registers when the function has `#[target_feature]` enabled. Occasionally specific `wide` intrinsic choices don't re-autovectorize; profile to identify these cases.
-
-**Best practice with `#[multiversed]`:** Place the dispatch macro at a high level, outside the loop, with `wide` usage in `#[inline(always)]` inner functions:
-
-```rust
-use multiversioned::multiversioned;
-use wide::f32x8;
-
-#[inline(always)]
-fn inner_loop(data: &mut [f32]) {
-    for chunk in data.chunks_exact_mut(8) {
-        let v = f32x8::from(chunk);
-        // ... wide operations
-    }
-}
-
-#[multiversioned(targets("x86_64+avx2+fma", "x86_64+sse4.1", "aarch64+neon"))]
-pub fn process(data: &mut [f32]) {
-    inner_loop(data);  // Compiler can still optimize
-}
-```
-
-The compiler optimizes significantly even without native AVX2—but not as much as with proper runtime dispatch.
-
-### Autovectorization (Let the Compiler Do It)
-
-For many operations, simple scalar code autovectorizes better than explicit chunked loops:
-
-```rust
-use multiversion::multiversion;
-
-// ✅ GOOD: Simple iterator - compiler autovectorizes perfectly
-#[multiversion(targets("x86_64+avx2+fma", "x86_64+sse4.1", "aarch64+neon"))]
-fn scale_row(data: &mut [f32], factor: f32) {
-    for x in data.iter_mut() {
-        *x *= factor;
-    }
-}
-
-// ❌ WORSE: Explicit chunks can PREVENT vectorization
-fn scale_row_chunked(data: &mut [f32], factor: f32) {
-    for chunk in data.chunks_exact_mut(8) {
-        for i in 0..8 {  // This loop often prevents vectorization!
-            chunk[i] *= factor;
-        }
-    }
-}
-```
-
-**When `chunks_exact` helps:** When you need to process fixed-size blocks (8x8 DCT, 16-byte alignment) or use `bytemuck` casting:
-
-```rust
-// ✅ GOOD: chunks_exact for block processing
-let blocks: &mut [[f32; 64]] = bytemuck::cast_slice_mut(data);
-for block in blocks {
-    dct_8x8(block);
-}
-
-// ✅ GOOD: Assert length for compiler hints
-fn process_block(data: &mut [f32]) {
-    assert!(data.len() >= 16);
-    // Compiler now knows bounds, can vectorize
-}
-```
-
-### Rust 1.85+ Contextual Intrinsic Safety
-
-**Key insight:** As of Rust 1.85, value-based SIMD intrinsics are **safe** inside `#[target_feature]` functions. No `unsafe` block needed!
-
-```rust
-#[target_feature(enable = "avx2")]
-fn process_avx2(a: __m256, b: __m256) -> __m256 {
-    // ALL of these are SAFE - no unsafe block!
-    let sum = _mm256_add_ps(a, b);
-    let prod = _mm256_mul_ps(sum, sum);
-    let blended = _mm256_blend_ps::<0b10101010>(prod, sum);
-    _mm256_sqrt_ps(blended)
-}
-```
-
-**What's still unsafe:**
-- **Pointer-based operations** (load/store with raw pointers) - use `safe_unaligned_simd` or archmage::mem
-- **Calling** a `#[target_feature]` function from normal code - use archmage tokens for safe dispatch
-
-**The `#[arcane]` macro** generates the `#[target_feature]` inner function, so inside archmage functions, value intrinsics are safe:
-
-```rust
-use archmage::{arcane, Has256BitSimd};
-use std::arch::x86_64::*;
-
-#[arcane]
-fn dct_butterfly(_token: impl Has256BitSimd, a: __m256, b: __m256) -> (__m256, __m256) {
-    // Safe! No unsafe needed for value operations
-    let sum = _mm256_add_ps(a, b);
-    let diff = _mm256_sub_ps(a, b);
-    (sum, diff)
-}
-```
-
-**For loads/stores**, use `safe_unaligned_simd` which is also safe inside `#[arcane]`:
-
-```rust
-#[arcane]
-fn load_and_process(_token: impl Has256BitSimd, data: &[f32; 8]) -> __m256 {
-    // safe_unaligned_simd has #[target_feature], so this is a safe call!
-    let v = safe_unaligned_simd::x86_64::_mm256_loadu_ps(data);
-    _mm256_mul_ps(v, v)  // Also safe
-}
-```
-
-### SIMD with archmage (When Autovectorization Fails)
-
-When the compiler can't autovectorize critical loops (DCT, color conversion, filtering), use [archmage](https://crates.io/crates/archmage) for safe, explicit SIMD:
-
-```rust
-use archmage::{Desktop64, Has256BitSimd, SimdToken, arcane};
-use std::arch::x86_64::*;
-
-/// Process 8 pixels at once with AVX2
-#[arcane]
-fn apply_gamma_avx2(_token: impl Has256BitSimd, pixels: &mut [[f32; 8]]) {
-    let gamma = _mm256_set1_ps(2.2);
-    for chunk in pixels {
-        // Use safe_unaligned_simd for loads (safe inside #[arcane])
-        let v = safe_unaligned_simd::x86_64::_mm256_loadu_ps(chunk);
-        // Value intrinsics are safe inside #[arcane] - no unsafe needed!
-        let result = fast_pow_avx2(v, gamma);
-        // Store still needs unsafe (raw pointer)
-        unsafe { _mm256_storeu_ps(chunk.as_mut_ptr(), result) };
-    }
-}
-
-// Dispatch based on CPU capabilities
-pub fn apply_gamma(pixels: &mut [f32]) {
-    if let Some(token) = Desktop64::summon() {
-        // AVX2 path - ~8x faster
-        let chunks: &mut [[f32; 8]] = bytemuck::cast_slice_mut(pixels);
-        apply_gamma_avx2(token, chunks);
-    } else {
-        // Scalar fallback
-        for p in pixels {
-            *p = p.powf(2.2);
-        }
-    }
-}
-```
-
-**Key points:**
-
-1. **Value intrinsics are SAFE inside `#[arcane]`** (Rust 1.85+):
-   ```rust
-   #[arcane]
-   fn process(_token: impl Has256BitSimd, a: __m256, b: __m256) -> __m256 {
-       // No unsafe needed! Value operations are safe in #[target_feature] context
-       _mm256_add_ps(_mm256_mul_ps(a, b), a)
-   }
-   ```
-
-2. **Use `safe_unaligned_simd` for loads** (also safe inside `#[arcane]`):
-   ```rust
-   #[arcane]
-   fn load(_token: impl Has256BitSimd, data: &[f32; 8]) -> __m256 {
-       safe_unaligned_simd::x86_64::_mm256_loadu_ps(data)  // Safe call!
-   }
-   ```
-
-3. **Only 2-3 targets matter in practice:**
-   - **X86V3 (AVX2+FMA)**: `Desktop64` - covers 95%+ of x86-64 CPUs (Haswell 2013+, Zen 1+)
-   - **X86V4 (AVX-512)**: Optional - CPUs often optimize AVX2 to AVX-512 in microcode
-   - **NeonFp16**: ARM with half-precision support (Apple Silicon, newer ARM servers)
-
-4. **Use `Desktop64` as your baseline** - it's X86V3 (AVX2+FMA):
-   ```rust
-   #[arcane]
-   fn dct_8x8(_token: impl Has256BitSimd, block: &mut [f32; 64]) {
-       // Works with Desktop64, covers nearly all modern x86
-   }
-   ```
-
-5. **Test scalar fallbacks** with `ARCHMAGE_DISABLE=1 cargo test`
-
-6. **Simple dispatch pattern**:
-   ```rust
-   use archmage::{Desktop64, NeonToken, SimdToken};
-
-   pub fn process(data: &mut [f32]) {
-       if let Some(t) = Desktop64::summon() {
-           process_avx2(t, data);
-       } else if let Some(t) = NeonToken::summon() {
-           process_neon(t, data);
-       } else {
-           process_scalar(data);
-       }
-   }
-   ```
-
-**When to use archmage vs autovectorization:**
-
-| Scenario | Approach |
-|----------|----------|
-| Simple loops (add, multiply) | Let compiler autovectorize |
-| Long row iteration | `multiversion` + scalar code |
-| Complex shuffles, permutes | archmage |
-| DCT/IDCT butterflies | archmage |
-| Precise FMA ordering | archmage |
-| Gather/scatter | archmage |
-| Small fixed-size blocks (8x8) | archmage (autovec often fails) |
-
----
-
-## Anti-Patterns to Avoid
+## Anti-Patterns
 
 ### 1. Giant Constructor
 
 ```rust
 // BAD: Too many required parameters, order matters
-let enc = Encoder::new(width, height, quality, subsampling, progressive,
-                       optimize_huffman, icc_profile, ...)?;
+let enc = Encoder::new(width, height, quality, subsampling, progressive, ...)?;
 
-// GOOD: Config builder
-let enc = EncoderConfig::ycbcr(85, ChromaSubsampling::Quarter)
-    .progressive(true)
-    .encode_from_bytes(width, height, layout)?;
+// GOOD: Config builder + request
+let config = EncoderConfig::ycbcr(85, ChromaSubsampling::Quarter).with_progressive(true);
+let encoded = config.encode_request(w, h, PixelLayout::Rgb8).encode(&pixels)?;
 ```
 
 ### 2. Default for Semantic Requirements
 
 ```rust
-// BAD: What quality does Default give?
+// BAD: What quality does Default give? What color mode?
 let config = EncoderConfig::default();
 
-// GOOD: Explicit quality
-let config = EncoderConfig::ycbcr(85, ChromaSubsampling::Quarter);
+// GOOD: Explicit quality and mode
+let config = LossyConfig::ycbcr(85, ChromaSubsampling::Quarter);
 ```
 
-### 3. Mixed Abstraction Levels
+### 3. Metadata on Reusable Config
 
 ```rust
-// BAD: Mixing raw bytes and typed pixels in same function
-fn encode(pixels: &[u8], format: PixelFormat, ...) -> Result<Vec<u8>>;
+// BAD: ICC profile baked into reusable config — wrong if batch-encoding
+//      images with different color profiles
+let config = EncoderConfig::new().icc_profile(icc_bytes);
 
-// GOOD: Separate entry points
-fn encode_from_bytes(data: &[u8], layout: PixelLayout, ...) -> Result<BytesEncoder>;
-fn encode_from_rgb<P: Pixel>(pixels: &[P], ...) -> Result<RgbEncoder<P>>;
+// GOOD: Metadata on request or factored struct
+let meta = ImageMetadata::new().icc_profile(&icc_bytes);
+let request = config.encode_request(w, h, layout).with_metadata(&meta);
 ```
 
-### 4. Non-Interruptible Operations
+### 4. Generic Type Pollution
 
 ```rust
-// BAD: No way to cancel
+// BAD: Generic infects encoder type, complicates boxing/FFI
+let enc: RgbEncoder<rgb::RGBA<u8>> = config.encode_from_rgb(w, h)?;
+
+// GOOD: Enum-based, generic at boundary only
+let request = config.encode_request(w, h, PixelLayout::Rgba8);
+request.encode(&pixels)?;           // enum dispatch inside
+request.encode_rgb(&typed_pixels)?; // generic convenience, delegates to enum
+```
+
+### 5. Non-Interruptible Operations
+
+```rust
+// BAD: No way to cancel a 50MP encode
 fn encode(pixels: &[u8]) -> Result<Vec<u8>>;
 
-// GOOD: Cancellation support
-fn push_packed(&mut self, data: &[u8], stop: impl Stop) -> Result<()>;
+// GOOD: Cancellation via request
+let request = config.encode_request(w, h, layout).with_stop(&cancel_flag);
+request.encode(&pixels)?;
 ```
 
-### 5. Allocating When Caller Has Buffer
+### 6. Allocating When Caller Has Buffer
 
 ```rust
 // BAD: Always allocates
@@ -681,42 +738,66 @@ fn decode(data: &[u8]) -> Result<Vec<u8>>;
 fn decode_into(data: &[u8], output: &mut [u8], stride: u32) -> Result<(u32, u32)>;
 ```
 
+### 7. finish() on One-Shot, encode() on Streaming
+
+```rust
+// BAD: Semantic mismatch
+let request = EncodeRequest::new(...);
+request.finish()?;  // Nothing was "started"!
+
+// BAD: Semantic mismatch
+encoder.push(&data)?;
+encoder.encode()?;  // You already encoded, now you're just flushing
+
+// GOOD: Names match semantics
+request.encode()?;   // One-shot: whole operation
+encoder.finish()?;   // Streaming: completing what was started
+```
+
 ---
 
 ## Summary Checklist
 
 ### Encoder
-- [ ] Config struct is dimension-independent and reusable
-- [ ] Required parameters (quality, mode) via named constructors
-- [ ] Optional parameters via builder methods
-- [ ] Multiple entry points for bytes/typed pixels/planar
-- [ ] Streaming push API for large images
+- [ ] Three-layer: Config → Request → Encoder
+- [ ] Config is dimension-independent and reusable
+- [ ] Required parameters (quality, mode) via named constructors, not Default
+- [ ] Optional parameters via `with_` builder methods, bare-name getters
+- [ ] EncodeRequest binds dimensions, pixel format, metadata, limits, stop
+- [ ] Metadata factored into ImageMetadata struct, on request not config
+- [ ] Streaming push API for large images via `request.build()` → Encoder
+- [ ] One-shot uses `encode()`, streaming uses `finish()`
+- [ ] `_to()` variants std-only (IO abstraction, not file IO)
 - [ ] Memory estimation before encoding
-- [ ] Cooperative cancellation support
+- [ ] Cooperative cancellation via `&dyn Stop`
+- [ ] Limits with `Option<u64>` fields including `max_pixels`
 - [ ] Quality abstraction supporting multiple scales
 
 ### Decoder
-- [ ] Simple one-shot functions for basic use
-- [ ] Builder pattern for advanced options (crop, scale)
+- [ ] Three-layer: Config → Request → Decoder
+- [ ] Simple one-shot convenience functions for basic use
+- [ ] DecodeRequest specifies desired output format (enables internal optimization)
 - [ ] Info retrieval before decode
 - [ ] Zero-copy decode_into variants
-- [ ] Streaming decode for progressive display
-- [ ] Multiple output formats (RGBA, RGB, BGR, YUV)
-- [ ] Typed pixel output support
+- [ ] Streaming decode for progressive display / network input
+- [ ] Multiple output formats via PixelLayout
 
 ### Both
-- [ ] Non-exhaustive error enum
+- [ ] `#[non_exhaustive]` error enums
+- [ ] `At<>` error wrapping for location tracking
+- [ ] Separate `EncodeError` / `DecodeError` types
 - [ ] Feature flags for optional functionality
-- [ ] no_std support where feasible
-- [ ] Clear stride conventions documented
+- [ ] no_std + alloc support (std opt-in for IO)
+- [ ] `EncodeStats` / allocation tracking
+- [ ] Resource estimation on config, Limits enforcement on request
 
 ---
 
 ## Reference Implementations
 
-- **Encoder**: [jpegli-rs](https://github.com/imazen/jpegli-rs) - `jpegli::encoder` module
-- **Decoder**: [webpx](https://github.com/imazen/webpx) - `decode.rs`, `streaming.rs`
+- **Encoder**: [zenjpeg](https://github.com/imazen/zenjpeg) — three-layer pattern, streaming push, quality abstraction
+- **Decoder**: [zenwebp](https://github.com/imazen/zenwebp) — EncodeRequest, DecodeRequest, Limits, streaming decoder
 
 ## License
 
-CC0 - Public Domain. Use these patterns freely.
+CC0 — Public Domain. Use these patterns freely.
